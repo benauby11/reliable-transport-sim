@@ -4,10 +4,12 @@ from lossy_socket import LossyUDP
 from socket import INADDR_ANY
 import struct
 import concurrent.futures
+import time
 
 UDP_size = 1472
-header_size = 8
+header_size = 9
 max_payload_size = UDP_size - header_size
+timeout = 0.25
 
 class Streamer:
     def __init__(self, dst_ip, dst_port,
@@ -22,6 +24,7 @@ class Streamer:
         self.rec_num = 0
         self.rec_buf = []
         self.closed = False
+        self.ack = False
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         executor.submit(self.listener)
 
@@ -31,13 +34,20 @@ class Streamer:
                 data, addr = self.socket.recvfrom()
                 if not data:
                     continue
-                header = struct.unpack('2i', data[:header_size])
+                header = struct.unpack('ii?', data[:header_size])
                 data = data[header_size:]
                 seq_num = int(header[0])
                 payload_size = int(header[1])
-                payload = data[:payload_size]
-                self.rec_buf.append([seq_num, payload])
-                self.rec_buf = sorted(self.rec_buf, key=lambda p: p[0])
+                is_ack = int(header[2])
+                if is_ack:
+                    self.ack = True
+                else:
+                    ack_header = struct.pack('ii?', self.send_num, payload_size, 1)
+                    self.socket.sendto(ack_header, (self.dst_ip, self.dst_port))
+                    print("SENDING ACK")
+                    payload = data[:payload_size]
+                    self.rec_buf.append([seq_num, payload])
+                    self.rec_buf = sorted(self.rec_buf, key=lambda p: p[0])
             except Exception as e:
                 print("listener died!")
                 print(e)
@@ -50,9 +60,18 @@ class Streamer:
             if payload_size == 0:
                 payload_size = max_payload_size
 
-            header = struct.pack('2i', self.send_num, payload_size)
+            header = struct.pack('ii?', self.send_num, payload_size, 0)
             packet = header + data_bytes[:payload_size]
             self.socket.sendto(packet, (self.dst_ip, self.dst_port))
+            send_time = time.perf_counter()
+            while not self.ack:
+                if time.perf_counter() - 0.25 >= send_time:
+                    self.socket.sendto(packet, (self.dst_ip, self.dst_port))
+                    send_time = time.perf_counter()
+                    continue
+                time.sleep(0.01)
+            print("ACK received")
+            self.ack = False
             data_bytes = data_bytes[payload_size:]
             total_len -= payload_size
             self.send_num += 1
