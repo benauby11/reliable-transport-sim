@@ -3,19 +3,11 @@ from lossy_socket import LossyUDP
 # do not import anything else from socket except INADDR_ANY
 from socket import INADDR_ANY
 import struct
+import concurrent.futures
 
 UDP_size = 1472
 header_size = 8
 max_payload_size = UDP_size - header_size
-
-# Given a sorted array, are all sequence numbers
-# present starting from the given starting sequence number
-def can_return(seq_num, buf):
-    for i in range(len(buf)):
-        if buf[i][0] != seq_num:
-            return False
-        seq_num += 1
-    return True
 
 class Streamer:
     def __init__(self, dst_ip, dst_port,
@@ -29,6 +21,26 @@ class Streamer:
         self.send_num = 0
         self.rec_num = 0
         self.rec_buf = []
+        self.closed = False
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        executor.submit(self.listener)
+
+    def listener(self):
+        while not self.closed:  # a later hint will explain self.closed
+            try:
+                data, addr = self.socket.recvfrom()
+                if not data:
+                    continue
+                header = struct.unpack('2i', data[:header_size])
+                data = data[header_size:]
+                seq_num = int(header[0])
+                payload_size = int(header[1])
+                payload = data[:payload_size]
+                self.rec_buf.append([seq_num, payload])
+                self.rec_buf = sorted(self.rec_buf, key=lambda p: p[0])
+            except Exception as e:
+                print("listener died!")
+                print(e)
 
     def send(self, data_bytes: bytes) -> None:
         total_len = len(data_bytes)
@@ -47,24 +59,16 @@ class Streamer:
 
     def recv(self) -> bytes:
         """Blocks (waits) if no data is ready to be read from the connection."""
-        data, addr = self.socket.recvfrom()
         to_return = b''
-        header = struct.unpack('2i', data[:header_size])
-        data = data[header_size:]
-        seq_num = int(header[0])
-        payload_size = int(header[1])
-        payload = data[:payload_size]
-        self.rec_buf.append([seq_num, payload])
-        self.rec_buf = sorted(self.rec_buf, key=lambda p: p[0])
-        if can_return(self.rec_num, self.rec_buf):
-            for pair in self.rec_buf:
-                to_return = to_return + pair[1]
-            self.rec_num += len(self.rec_buf)
-            self.rec_buf = []
+        if len(self.rec_buf) >= 1 and self.rec_buf[0][0] == self.rec_num:
+            to_return = to_return + self.rec_buf[0][1]
+            self.rec_num += 1
+            self.rec_buf.pop(0)
         return to_return
 
     def close(self) -> None:
         """Cleans up. It should block (wait) until the Streamer is done with all
            the necessary ACKs and retransmissions"""
         # your code goes here, especially after you add ACKs and retransmissions.
-        pass
+        self.closed = True
+        self.socket.stoprecv()
