@@ -7,7 +7,7 @@ import concurrent.futures
 import time
 
 UDP_size = 1472
-header_size = 9
+header_size = 12
 max_payload_size = UDP_size - header_size
 timeout = 0.25
 
@@ -22,7 +22,7 @@ class Streamer:
         self.dst_port = dst_port
         self.send_num = 0
         self.rec_num = 0
-        self.rec_buf = []
+        self.rec_buf = {}
         self.closed = False
         self.ack = False
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -34,20 +34,27 @@ class Streamer:
                 data, addr = self.socket.recvfrom()
                 if not data:
                     continue
-                header = struct.unpack('ii?', data[:header_size])
+                header = struct.unpack('iii', data[:header_size])
                 data = data[header_size:]
                 seq_num = int(header[0])
                 payload_size = int(header[1])
-                is_ack = int(header[2])
-                if is_ack:
+                is_ack = int(header[2]) == 1
+                is_fin = int(header[2]) == 2
+                if is_fin:
+                    print("SENDING ACK FOR FIN")
+                    ack_header = struct.pack('iii', seq_num, 0, 1)
+                    self.socket.sendto(ack_header, (self.dst_ip, self.dst_port))
+                    continue
+                if is_ack and seq_num == self.send_num:
                     self.ack = True
                 else:
-                    ack_header = struct.pack('ii?', self.send_num, payload_size, 1)
-                    self.socket.sendto(ack_header, (self.dst_ip, self.dst_port))
-                    print("SENDING ACK")
+                    if seq_num < self.rec_num:
+                        print("DUPLICATE PACKET: RESENDING ACK")
+                        ack_header = struct.pack('iii', seq_num, 0, 1)
+                        self.socket.sendto(ack_header, (self.dst_ip, self.dst_port))
+                        continue
                     payload = data[:payload_size]
-                    self.rec_buf.append([seq_num, payload])
-                    self.rec_buf = sorted(self.rec_buf, key=lambda p: p[0])
+                    self.rec_buf[seq_num] = payload
             except Exception as e:
                 print("listener died!")
                 print(e)
@@ -60,17 +67,19 @@ class Streamer:
             if payload_size == 0:
                 payload_size = max_payload_size
 
-            header = struct.pack('ii?', self.send_num, payload_size, 0)
+            header = struct.pack('iii', self.send_num, payload_size, 0)
             packet = header + data_bytes[:payload_size]
+            print("SENDING PACKET")
             self.socket.sendto(packet, (self.dst_ip, self.dst_port))
             send_time = time.perf_counter()
             while not self.ack:
                 if time.perf_counter() - 0.25 >= send_time:
+                    print("WAITING FOR ACK: RESENDING PACKET")
                     self.socket.sendto(packet, (self.dst_ip, self.dst_port))
                     send_time = time.perf_counter()
                     continue
                 time.sleep(0.01)
-            print("ACK received")
+            print("ACK RECEIVED")
             self.ack = False
             data_bytes = data_bytes[payload_size:]
             total_len -= payload_size
@@ -79,15 +88,32 @@ class Streamer:
     def recv(self) -> bytes:
         """Blocks (waits) if no data is ready to be read from the connection."""
         to_return = b''
-        if len(self.rec_buf) >= 1 and self.rec_buf[0][0] == self.rec_num:
-            to_return = to_return + self.rec_buf[0][1]
+        if len(self.rec_buf) >= 1 and self.rec_buf.get(self.rec_num) is not None:
+            print("PACKET RECEIVED: SENDING ACK")
+            ack_header = struct.pack('iii', self.rec_num, 0, 1)
+            self.socket.sendto(ack_header, (self.dst_ip, self.dst_port))
+            to_return = to_return + self.rec_buf[self.rec_num]
+            self.rec_buf.pop(self.rec_num)
             self.rec_num += 1
-            self.rec_buf.pop(0)
         return to_return
 
     def close(self) -> None:
         """Cleans up. It should block (wait) until the Streamer is done with all
            the necessary ACKs and retransmissions"""
         # your code goes here, especially after you add ACKs and retransmissions.
+        print("SENDING FIN")
+        fin_header = struct.pack('iii', self.send_num, 0, 2)
+        self.socket.sendto(fin_header, (self.dst_ip, self.dst_port))
+        send_time = time.perf_counter()
+        while not self.ack:
+            if time.perf_counter() - 0.25 >= send_time:
+                print("WAITING FOR FIN ACK: SENDING FIN")
+                self.socket.sendto(fin_header, (self.dst_ip, self.dst_port))
+                send_time = time.perf_counter()
+                continue
+            time.sleep(0.01)
+        print("FIN ACK RECEIVED")
+
+        self.ack = False
         self.closed = True
         self.socket.stoprecv()
