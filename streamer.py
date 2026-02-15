@@ -5,9 +5,10 @@ from socket import INADDR_ANY
 import struct
 import concurrent.futures
 import time
+import hashlib
 
 UDP_size = 1472
-header_size = 10
+header_size = 26
 max_payload_size = UDP_size - header_size
 timeout = 0.25
 
@@ -35,12 +36,13 @@ class Streamer:
                 data, addr = self.socket.recvfrom()
                 if not data:
                     continue
-                header = struct.unpack('ii??', data[:header_size])
+                header = struct.unpack('16sii??', data[:header_size])
                 data = data[header_size:]
-                seq_num = int(header[0])
-                payload_size = int(header[1])
-                is_ack = int(header[2]) == 1
-                is_fin = int(header[3]) == 1
+                hash_digest = header[0]
+                seq_num = int(header[1])
+                payload_size = int(header[2])
+                is_ack = int(header[3]) == 1
+                is_fin = int(header[4]) == 1
                 if is_ack and seq_num == self.send_num and is_fin == False:
                     self.ack = True
                 elif is_ack and is_fin:
@@ -48,23 +50,20 @@ class Streamer:
                 elif is_ack:
                     continue
                 elif is_fin and seq_num == self.send_num:
-                    print("Sending fin ack")
-                    print(seq_num)
-                    print(self.rec_num)
-                    print(self.send_num)
-                    finack_header = struct.pack('ii??', seq_num, 0, 1, 1)
+                    finack_header = struct.pack('16sii??', b'', seq_num, 0, 1, 1)
                     self.socket.sendto(finack_header, (self.dst_ip, self.dst_port))
                 else:
-                    print(self.rec_buf)
                     if self.rec_buf.get(seq_num) is not None or seq_num < self.rec_num:
-                        print("DUPLICATE PACKET: RESENDING ACK")
-                        ack_header = struct.pack('ii??', seq_num, 0, 1, 0)
+                        ack_header = struct.pack('16sii??', b'', seq_num, 0, 1, 0)
                         self.socket.sendto(ack_header, (self.dst_ip, self.dst_port))
                         continue
                     if seq_num < self.rec_num:
                         continue
-                    payload = data[:payload_size]
-                    self.rec_buf[seq_num] = payload
+                    hash = hashlib.md5(data)
+                    digest = hash.digest()
+                    if hash_digest == digest:
+                        payload = data[:payload_size]
+                        self.rec_buf[seq_num] = payload
             except Exception as e:
                 print("listener died!")
                 print(e)
@@ -77,7 +76,11 @@ class Streamer:
             if payload_size == 0:
                 payload_size = max_payload_size
 
-            header = struct.pack('ii??', self.send_num, payload_size, 0, 0)
+            hash = hashlib.md5(data_bytes[:payload_size])
+            digest = hash.digest()
+
+            header = struct.pack('16sii??', digest, self.send_num, payload_size, 0, 0)
+            print(hash.digest_size)
             packet = header + data_bytes[:payload_size]
             self.socket.sendto(packet, (self.dst_ip, self.dst_port))
             send_time = time.perf_counter()
@@ -87,9 +90,6 @@ class Streamer:
                     send_time = time.perf_counter()
                     continue
                 time.sleep(0.01)
-            print("ACK received")
-            print(self.send_num)
-            print(self.rec_num)
             self.ack = False
             data_bytes = data_bytes[payload_size:]
             total_len -= payload_size
@@ -99,8 +99,7 @@ class Streamer:
         """Blocks (waits) if no data is ready to be read from the connection."""
         to_return = b''
         if len(self.rec_buf) >= 1 and self.rec_buf.get(self.rec_num) is not None:
-            print("sending ACK")
-            ack_header = struct.pack('ii??', self.rec_num, 0, 1, 0)
+            ack_header = struct.pack('16sii??', b'', self.rec_num, 0, 1, 0)
             self.socket.sendto(ack_header, (self.dst_ip, self.dst_port))
             to_return = to_return + self.rec_buf[self.rec_num]
             self.rec_buf.pop(self.rec_num)
@@ -111,8 +110,7 @@ class Streamer:
         """Cleans up. It should block (wait) until the Streamer is done with all
            the necessary ACKs and retransmissions"""
         # your code goes here, especially after you add ACKs and retransmissions.
-        print("CLOSING")
-        fin_header = struct.pack('ii??', self.rec_num, 0, 0, 1)
+        fin_header = struct.pack('16sii??', b'', self.rec_num, 0, 0, 1)
         self.socket.sendto(fin_header, (self.dst_ip, self.dst_port))
         send_time = time.perf_counter()
         while not self.fin_ack:
@@ -121,7 +119,6 @@ class Streamer:
                 send_time = time.perf_counter()
                 continue
             time.sleep(0.01)
-        print("GOT FIN ACK")
         self.fin_ack = False
         time.sleep(2)
         self.closed = True
