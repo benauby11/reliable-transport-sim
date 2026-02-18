@@ -102,8 +102,6 @@ class Streamer:
                     if not self.send_buf:
                         if self.timer:
                             self.timer.cancel()
-                    else:
-                        self.start_timer()
 
                     self.lock.release()
                 # we have a FIN ACK
@@ -112,7 +110,7 @@ class Streamer:
                 elif is_ack:
                     continue
                 elif is_fin:
-                    print("Sending fin ack")
+                    #print("Sending fin ack")
                     header_to_hash = struct.pack("ii??", seq_num, 0, 1, 1)
                     hash_val = hashlib.md5(header_to_hash).digest()
                     finack_header = struct.pack(PACK_FORMAT, seq_num, 0, 1, 1, hash_val)
@@ -156,12 +154,14 @@ class Streamer:
             hash_val = hashlib.md5(header_to_hash + data_bytes[:payload_size]).digest()
             header = struct.pack(PACK_FORMAT, self.send_num, payload_size, 0, 0, hash_val)
             packet = header + data_bytes[:payload_size]
+            self.lock.acquire()
             self.send_buf[self.send_num] = packet
             self.send_num += 1
             self.socket.sendto(packet, (self.dst_ip, self.dst_port))
             # we gotta start the timer to wait to get ACKs
             if len(self.send_buf) == 1:
                 self.start_timer()
+            self.lock.release()
             self.expires = time.perf_counter() + 0.25
             send_time = time.perf_counter()
             #print("ACK received")
@@ -172,7 +172,7 @@ class Streamer:
         """Blocks (waits) if no data is ready to be read from the connection."""
         to_return = b''
         while self.rec_buf.get(self.rec_num) is None:
-            time.sleep(0.25)
+            time.sleep(0.01)
         to_return = to_return + self.rec_buf[self.rec_num]
         self.rec_buf.pop(self.rec_num)
         self.rec_num += 1
@@ -181,13 +181,12 @@ class Streamer:
     def close(self) -> None:
         """Cleans up. It should block (wait) until the Streamer is done with all
            the necessary ACKs and retransmissions"""
-        # your code goes here, especially after you add ACKs and retransmissions.
-        print("CLOSING")
-        print("WAITING FOR ACKS")
-        print(self.send_num)
-        print(self.last_acked + 1)
+
+        # wait until we have all ACKs
         while (self.send_num - 1) != self.last_acked:
             time.sleep(0.01)
+
+        # hash the header
         header_to_hash = struct.pack("ii??", self.send_num, 0, 0, 1)
         hash_val = hashlib.md5(header_to_hash).digest()
         fin_header = struct.pack(PACK_FORMAT, self.send_num, 0, 0, 1, hash_val)
@@ -199,7 +198,7 @@ class Streamer:
                 send_time = time.perf_counter()
                 continue
             time.sleep(0.01)
-        print("GOT FIN ACK")
+        #print("GOT FIN ACK")
 
         # now, we gotta wait for the fin to come in from the other before closing
         while not self.got_fin:
